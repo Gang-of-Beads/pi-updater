@@ -46,6 +46,28 @@ interface VersionCache {
    * the owner reported the same extension prompt more than ten times.
    */
   settledExtensionSets?: string[];
+  /**
+   * Versions this machine has already been asked about. The offer is one
+   * popup per version per machine: the owner sees every session of a
+   * long-lived host as the same seat, so a prompt answered - or closed -
+   * anywhere must not return anywhere else.
+   */
+  promptedVersions?: string[];
+}
+
+/** Record that this machine has seen the offer for `version`. */
+function notePromptedVersion(version: string) {
+  const prev = readCache();
+  const prompted = new Set(prev?.promptedVersions ?? []);
+  prompted.add(version);
+  writeCache({
+    latestVersion: prev?.latestVersion ?? version,
+    dismissedVersion: prev?.dismissedVersion,
+    actedVersion: prev?.actedVersion,
+    checkedAt: prev?.checkedAt,
+    settledExtensionSets: prev?.settledExtensionSets,
+    promptedVersions: [...prompted].slice(-16),
+  });
 }
 
 export function extensionSetKey(extensions: string[]): string {
@@ -63,6 +85,7 @@ function settleExtensionSet(extensions: string[]) {
     actedVersion: prev?.actedVersion,
     checkedAt: prev?.checkedAt,
     settledExtensionSets: [...settled].slice(-16),
+    promptedVersions: prev?.promptedVersions,
   });
 }
 
@@ -225,6 +248,8 @@ function dismissVersion(version: string) {
     dismissedVersion: version,
     actedVersion: cache?.actedVersion,
     checkedAt: cache?.checkedAt,
+    settledExtensionSets: cache?.settledExtensionSets,
+    promptedVersions: cache?.promptedVersions,
   });
 }
 
@@ -254,6 +279,7 @@ export function shouldPromptForVersion(input: {
 }): boolean {
   if (!isNewer(input.latest, input.runningVersion)) return false;
   if (input.prompted.has(input.latest)) return false;
+  if (input.cache?.promptedVersions?.includes(input.latest) === true) return false;
   if (input.cache?.dismissedVersion === input.latest) return false;
   if (input.cache?.actedVersion === input.latest) return false;
   return true;
@@ -554,15 +580,16 @@ export default function (pi: ExtensionAPI) {
       );
 
       if (!choice || choice === "Skip") {
+        // Closing without an answer counts as the answer "not this version"
+        // (the owner's ruling): an offer that returns because the dialog was
+        // cancelled is the same nag by another name.
+        dismissVersion(piLatest);
+        settleExtensionSet(extensions);
         // Skip on the combined prompt dismisses the pi version too: the owner
         // reported the prompt returning for an already-acted version, and a
         // dismissal that only sometimes dismisses is how that read from the
         // user's seat. The extension set settles as well - a skip answered in
         // one session answers it for the machine.
-        if (choice === "Skip") {
-          dismissVersion(piLatest);
-          settleExtensionSet(extensions);
-        }
         return;
       }
       // Acting on the offer records the version: the install lands on disk
@@ -585,8 +612,7 @@ export default function (pi: ExtensionAPI) {
         ignorePiVersion,
       ]);
 
-      if (!choice) return;
-      if (choice === "Skip") {
+      if (!choice || choice === "Skip") {
         dismissVersion(piLatest);
         return;
       }
@@ -608,7 +634,7 @@ export default function (pi: ExtensionAPI) {
       // Both answers settle the set machine-wide; an unanswered (dismissed
       // without an answer) prompt does not, so a genuinely ignored dialog
       // returns once but an ANSWERED one never nags another session.
-      if (choice === updateAction || choice === "Skip") settleExtensionSet(extensions);
+      settleExtensionSet(extensions);
       if (choice === updateAction) await doInstall(ctx, "extensions");
     }
   }
@@ -642,7 +668,7 @@ export default function (pi: ExtensionAPI) {
     if (!piLatest && openExtensions.length === 0) return;
 
     promptOpen = true;
-    if (piLatest) promptedVersions.add(piLatest);
+    if (piLatest) { promptedVersions.add(piLatest); notePromptedVersion(piLatest); }
     try {
       await showUpdatePrompt(ctx, { piLatest, extensions: openExtensions });
     } finally {
@@ -757,7 +783,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      if (piLatest) promptedVersions.add(piLatest);
+      if (piLatest) { promptedVersions.add(piLatest); notePromptedVersion(piLatest); }
       await showUpdatePrompt(ctx, { piLatest, extensions });
     },
   });

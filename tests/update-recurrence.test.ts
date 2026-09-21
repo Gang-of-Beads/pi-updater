@@ -51,3 +51,23 @@ describe("update prompt recurrence", () => {
     expect(decision("0.84.4", { actedVersion: "0.84.3" })).toBe(true);
   });
 });
+
+describe("one offer per version per machine", () => {
+  it("does not prompt again for a version this machine has already been shown", () => {
+    expect(shouldPromptForVersion({
+      latest: "0.86.1",
+      runningVersion: "0.85.0",
+      cache: { latestVersion: "0.86.1", promptedVersions: ["0.86.1"] },
+      prompted: new Set(),
+    })).toBe(false);
+  });
+
+  it("still prompts for a newer version than the one already shown", () => {
+    expect(shouldPromptForVersion({
+      latest: "0.87.0",
+      runningVersion: "0.85.0",
+      cache: { latestVersion: "0.87.0", promptedVersions: ["0.86.1"] },
+      prompted: new Set(),
+    })).toBe(true);
+  });
+});
