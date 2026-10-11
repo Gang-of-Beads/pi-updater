@@ -662,6 +662,12 @@ export default function (pi: ExtensionAPI) {
     }
     if (!hasUi) return;
     if (promptOpen) return;
+    // A host that does not execute custom components is a surface with its own
+    // shell - pi-web - and that shell shows the offer itself, once per machine,
+    // outside any one conversation. Prompting here as well put the same offer
+    // in every session's transcript. Refreshing the cache above is what that
+    // shell reads, so the check still earns its keep.
+    if (!(await hostCanRunCustom(ctx))) return;
 
     const piLatest = latest && canAutoPromptVersion(latest) ? latest : undefined;
     const openExtensions = unsettledExtensions(extensions);
