@@ -6,6 +6,7 @@ import { VERSION, BorderedLoader, getAgentDir } from "@earendil-works/pi-coding-
 import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { checkForModelUpdates, formatModelUpdates } from "./model-updates.js";
 
 const LATEST_VERSION_URL = "https://pi.dev/api/latest-version";
 function cacheFile(): string {
@@ -263,6 +264,24 @@ function actOnVersion(version: string) {
     checkedAt: cache?.checkedAt,
   });
 }
+
+/**
+ * What answering an update prompt records: the version dismissed or acted on,
+ * and the extension set settled. The demo answers with none of them recorded,
+ * so trying `/update --test` never silences a real offer.
+ */
+interface UpdateDecisions {
+  dismissVersion(version: string): void;
+  actOnVersion(version: string): void;
+  settleExtensionSet(extensions: string[]): void;
+}
+
+const RECORDED_DECISIONS: UpdateDecisions = { dismissVersion, actOnVersion, settleExtensionSet };
+const UNRECORDED_DECISIONS: UpdateDecisions = {
+  dismissVersion: () => {},
+  actOnVersion: () => {},
+  settleExtensionSet: () => {},
+};
 
 /**
  * The recurrence decision, pure and exported for tests: prompt for `latest`
@@ -564,7 +583,13 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  async function showUpdatePrompt(ctx: ExtensionContext, offer: UpdateOffer) {
+  async function showUpdatePrompt(
+    ctx: ExtensionContext,
+    offer: UpdateOffer,
+    install: (target: UpdateTarget, piLatest?: string) => Promise<void> =
+      (target, piLatest) => doInstall(ctx, target, piLatest),
+    decisions: UpdateDecisions = RECORDED_DECISIONS,
+  ) {
     const { piLatest, extensions } = offer;
     const extList = extensions.join(", ");
 
@@ -583,8 +608,8 @@ export default function (pi: ExtensionAPI) {
         // Closing without an answer counts as the answer "not this version"
         // (the owner's ruling): an offer that returns because the dialog was
         // cancelled is the same nag by another name.
-        dismissVersion(piLatest);
-        settleExtensionSet(extensions);
+        decisions.dismissVersion(piLatest);
+        decisions.settleExtensionSet(extensions);
         // Skip on the combined prompt dismisses the pi version too: the owner
         // reported the prompt returning for an already-acted version, and a
         // dismissal that only sometimes dismisses is how that read from the
@@ -595,11 +620,11 @@ export default function (pi: ExtensionAPI) {
       // Acting on the offer records the version: the install lands on disk
       // but a long-lived host keeps running the old version until restart,
       // and an unrecorded action is what made the prompt return.
-      actOnVersion(piLatest);
-      if (choice === updateAll || choice === updateExtensions) settleExtensionSet(extensions);
-      if (choice === updateAll) return doInstall(ctx, "all", piLatest);
-      if (choice === updatePi) return doInstall(ctx, "self", piLatest);
-      if (choice === updateExtensions) return doInstall(ctx, "extensions");
+      decisions.actOnVersion(piLatest);
+      if (choice === updateAll || choice === updateExtensions) decisions.settleExtensionSet(extensions);
+      if (choice === updateAll) return install("all", piLatest);
+      if (choice === updatePi) return install("self", piLatest);
+      if (choice === updateExtensions) return install("extensions");
       return;
     }
 
@@ -613,15 +638,15 @@ export default function (pi: ExtensionAPI) {
       ]);
 
       if (!choice || choice === "Skip") {
-        dismissVersion(piLatest);
+        decisions.dismissVersion(piLatest);
         return;
       }
       if (choice === ignorePiVersion) {
-        dismissVersion(piLatest);
+        decisions.dismissVersion(piLatest);
         return;
       }
       if (choice !== updateAction) return;
-      await doInstall(ctx, "self", piLatest);
+      await install("self", piLatest);
       return;
     }
 
@@ -634,8 +659,8 @@ export default function (pi: ExtensionAPI) {
       // Both answers settle the set machine-wide; an unanswered (dismissed
       // without an answer) prompt does not, so a genuinely ignored dialog
       // returns once but an ANSWERED one never nags another session.
-      settleExtensionSet(extensions);
-      if (choice === updateAction) await doInstall(ctx, "extensions");
+      decisions.settleExtensionSet(extensions);
+      if (choice === updateAction) await install("extensions");
     }
   }
 
@@ -688,6 +713,9 @@ export default function (pi: ExtensionAPI) {
     if (liveCheckStarted) return;
     liveCheckStarted = true;
 
+    // Model hints are independent: a slow catalog must not delay update prompts.
+    void checkForModelUpdates(ctx);
+
     // Wait for both checks and show a single consolidated prompt. Startup is
     // never blocked; the prompt simply appears when the checks resolve.
     void Promise.all([
@@ -696,10 +724,7 @@ export default function (pi: ExtensionAPI) {
     ])
       .then(([latest, extensions]) => {
         // Fall back to a previously cached pi version if the live fetch failed.
-        // Caught explicitly: a rejection from this void launch escapes the
-        // outer catch, and an escaped rejection does not just log - it brings
-        // down the whole process hosting the sessions.
-        maybeShowAutoPrompt(ctx, latest ?? getCachedUpgradeVersion(), extensions).catch(() => {});
+        return maybeShowAutoPrompt(ctx, latest ?? getCachedUpgradeVersion(), extensions);
       })
       .catch(() => {});
   }
@@ -715,32 +740,39 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("update", {
     description: "Check for pi updates and install with pi's native updater",
     handler: async (rawArgs, ctx) => {
-      // /update --test — simulate the full UI flow without a real install
+      // The demo uses the real presentation with fixture data and an inert installer.
       if (rawArgs?.trim() === "--test") {
-        const fakeLatest = "99.0.0";
-        const updateAction = "Update now";
-        const choice = await ctx.ui.select(`Update ${VERSION} → ${fakeLatest}`, [
-          updateAction,
-          "Skip",
-          `Ignore ${fakeLatest}`,
-        ]);
-        if (choice !== updateAction) return;
-
-        await ctx.ui.custom<void>((tui, theme, _kb, done) => {
-          const loader = new BorderedLoader(tui, theme, `Running ${UPDATE_COMMANDS.self.display}...`);
-          loader.onAbort = () => done();
-          setTimeout(() => done(), 1500);
-          return loader;
-        });
-
-        if (!canAutoRestart(ctx)) {
-          ctx.ui.notify(`Updated to ${fakeLatest}! Please restart pi.`, "info");
+        if (!ctx.hasUI || ("mode" in ctx && ctx.mode !== "tui")) {
+          ctx.ui.notify("The update demo requires an interactive terminal.", "warning");
           return;
         }
-
-        const ok = await restartPi(ctx);
-        if (ok) { ctx.shutdown(); return; }
-        ctx.ui.notify("Test restart failed.", "error");
+        const modelNotice = formatModelUpdates(ctx, [
+          {
+            current: { provider: "openai-codex", id: "gpt-6-sol", name: "GPT-6 Sol" },
+            latest: { provider: "openai-codex", id: "gpt-6.1-sol", name: "GPT-6.1 Sol" },
+          },
+          {
+            current: { provider: "anthropic", id: "claude-sonnet-5", name: "Claude Sonnet 5" },
+            latest: { provider: "anthropic", id: "claude-sonnet-5-5", name: "Claude Sonnet 5.5" },
+          },
+        ]);
+        ctx.ui.notify(`Demo only. Nothing will be changed.\n\n${modelNotice}`, "info");
+        await showUpdatePrompt(ctx, {
+          piLatest: "99.0.0",
+          extensions: ["example-tools", "example-prompts"],
+        }, async (target) => {
+          const completed = await ctx.ui.custom<boolean>((tui, theme, _kb, done) => {
+            const loader = new BorderedLoader(tui, theme, `Demo: ${UPDATE_COMMANDS[target].display}...`);
+            const timer = setTimeout(() => done(true), 1500);
+            loader.onAbort = () => {
+              clearTimeout(timer);
+              done(false);
+            };
+            return loader;
+          });
+          const status = completed ? "Demo complete. Nothing changed." : "Demo cancelled. Nothing changed.";
+          ctx.ui.notify(`${status}\n\n${modelNotice}`, "info");
+        }, UNRECORDED_DECISIONS);
         return;
       }
 
@@ -751,6 +783,18 @@ export default function (pi: ExtensionAPI) {
         );
         return;
       }
+
+      let modelNotice: string | undefined;
+      let updateStatus: string | undefined;
+      // Pi replaces consecutive info notices. Preserve both results, whichever
+      // check finishes first, without making the update prompt wait for models.
+      const showUpdateStatus = () => {
+        ctx.ui.notify([updateStatus, modelNotice].filter(Boolean).join("\n\n"), "info");
+      };
+      void checkForModelUpdates(ctx, true, (message) => {
+        modelNotice = message;
+        showUpdateStatus();
+      });
 
       const result = await ctx.ui.custom<{
         latest: string | undefined;
@@ -782,10 +826,8 @@ export default function (pi: ExtensionAPI) {
       const piLatest = latest && isNewer(latest, VERSION) ? latest : undefined;
 
       if (!piLatest && extensions.length === 0) {
-        ctx.ui.notify(
-          `Already on latest version (${VERSION}). Extensions are up to date.`,
-          "info",
-        );
+        updateStatus = `pi ${VERSION} · extensions up to date`;
+        showUpdateStatus();
         return;
       }
 
