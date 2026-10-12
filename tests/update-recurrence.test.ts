@@ -1,6 +1,6 @@
 /**
  * The recurrence invariant for the update prompt (owner report 2026-08-31:
- * "点了也没用，下次还来，即便已经update了" — the prompt kept returning even
+ * "clicking it does nothing; it comes back next time, even after updating" — the prompt kept returning even
  * after an update had been installed, because acting on the offer recorded
  * nothing and the running version only changes after a restart).
  *

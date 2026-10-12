@@ -552,8 +552,8 @@ export default function (pi: ExtensionAPI) {
 
     if (!canAutoRestart(ctx)) {
       // A long-lived host (pi-web's session daemon) keeps running the old
-      // version until IT is restarted — the owner reported the prompt as
-      // "点 了也没用" because the notice said "restart pi" while the running
+      // version until IT is restarted — the owner reported that clicking
+      // the prompt "did nothing" because the notice said "restart pi" while the running
       // daemon never changed. Name the actual restart the host needs.
       if (!hostCanRenderLoader(ctx)) {
         ctx.ui.notify(
