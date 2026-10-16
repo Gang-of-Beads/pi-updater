@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.6.0-preview.1 - unreleased
+## 0.6.0 - 2026-10-16
+
+- Publish the stable Gang of Beads distribution as `@gang-of-beads/pi-updater`. Existing update commands and provider settings remain unchanged.
 
 - Merges upstream 0.5.0 (model-family update hints, the offline `/update --test`
   demo) and 0.4.2 (the stale-context crash fix, alongside this fork's own).

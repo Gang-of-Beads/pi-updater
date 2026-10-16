@@ -4,8 +4,10 @@ pi-updater checks for [pi](https://pi.dev) and extension updates and lets you
 install them from your current session. It also shows newer releases in your
 scoped model families, without changing your models or settings.
 
-- npm: https://www.npmjs.com/package/pi-updater
-- repo: https://github.com/tonze/pi-updater
+- npm: https://www.npmjs.com/package/@gang-of-beads/pi-updater
+- repo: https://github.com/Gang-of-Beads/pi-updater
+
+This is the Gang of Beads distribution. Choose one installation source; remove an existing Git or upstream npm installation before switching to avoid duplicate update prompts.
 
 <img width="800" alt="Combined Pi and extension update prompt with Update all selected" src="https://raw.githubusercontent.com/tonze/pi-updater/main/docs/images/update-prompt.png" />
 
@@ -18,7 +20,7 @@ pi-updater does not manage packages itself.
 ## Installation
 
 ```bash
-pi install npm:pi-updater
+pi install npm:@gang-of-beads/pi-updater
 ```
 
 Requires pi 0.74.0 or later (the `@earendil-works` package scope). On older
@@ -142,7 +144,7 @@ not infer model families from names or refresh your provider configuration.
 ## Updating pi-updater itself
 
 ```bash
-pi update npm:pi-updater
+pi update npm:@gang-of-beads/pi-updater
 ```
 
 ## License
