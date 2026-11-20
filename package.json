@@ -14,8 +14,12 @@
     "url": "git+https://github.com/Gang-of-Beads/pi-updater.git"
   },
   "homepage": "https://github.com/Gang-of-Beads/pi-updater#readme",
-  "bugs": { "url": "https://github.com/Gang-of-Beads/pi-updater/issues" },
-  "publishConfig": { "access": "public" },
+  "bugs": {
+    "url": "https://github.com/Gang-of-Beads/pi-updater/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "keywords": [
     "pi-package",
     "pi-extension",
