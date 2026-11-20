@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.0 - 2026-11-20
+
+- Merges upstream 0.8.0, 0.7.0, 0.6.0 and 0.5.1: Pi 1.0 or newer, restart and update-flow fixes, project-trust aware extension checks, a validated version cache, and installing from hosts that cannot draw the loader (PI WEB and other RPC hosts) through notices.
+- The manifest names the repository's bugs URL and homepage, and the README lists the tracker.
+
 ## 0.6.0 - 2026-10-16
 
 - Publish the stable Gang of Beads distribution as `@gang-of-beads/pi-updater`. Existing update commands and provider settings remain unchanged.
