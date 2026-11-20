@@ -6,6 +6,7 @@ scoped model families, without changing your models or settings.
 
 - npm: https://www.npmjs.com/package/@gang-of-beads/pi-updater
 - repo: https://github.com/Gang-of-Beads/pi-updater
+- issues: https://github.com/Gang-of-Beads/pi-updater/issues
 
 This is the Gang of Beads distribution. Choose one installation source; remove an existing Git or upstream npm installation before switching to avoid duplicate update prompts.
 
