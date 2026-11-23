@@ -1,12 +1,20 @@
 import type {
   ExtensionAPI,
   ExtensionContext,
+  ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import { VERSION, BorderedLoader, getAgentDir } from "@earendil-works/pi-coding-agent";
+import {
+  VERSION,
+  BorderedLoader,
+  DefaultPackageManager,
+  SettingsManager,
+  getAgentDir,
+  parseArgs,
+} from "@earendil-works/pi-coding-agent";
 import { spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { checkForModelUpdates, formatModelUpdates } from "./model-updates.js";
+import { isDeepStrictEqual } from "node:util";
 
 const LATEST_VERSION_URL = "https://pi.dev/api/latest-version";
 function cacheFile(): string {
@@ -15,9 +23,7 @@ function cacheFile(): string {
 const UPDATE_COMMANDS = {
   self: { args: ["update", "--self"], display: "pi update --self" },
   extensions: { args: ["update", "--extensions"], display: "pi update --extensions" },
-  // --self --extensions rather than --all: pi < 0.80 doesn't parse --all,
-  // but the flag pair resolves to the "all" target on every supported version.
-  all: { args: ["update", "--self", "--extensions"], display: "pi update --self --extensions" },
+  all: { args: ["update", "--all"], display: "pi update --all" },
 } as const;
 
 type UpdateTarget = keyof typeof UPDATE_COMMANDS;
@@ -31,7 +37,7 @@ const ENV_SKIP_VERSION_CHECK = "PI_SKIP_VERSION_CHECK";
 const ENV_OFFLINE = "PI_OFFLINE";
 const ENV_INTERNAL_SKIP = "PI_UPDATER_SUPPRESSED_NATIVE_VERSION_CHECK";
 // One-shot: set on the pi process we restart into after an update, so the
-// user is not immediately re-prompted for updates they just declined.
+// user is not immediately notified about updates they just declined.
 const ENV_SUPPRESS_STARTUP_CHECK = "PI_UPDATER_SUPPRESS_STARTUP_CHECK";
 
 interface VersionCache {
@@ -98,7 +104,20 @@ export function unsettledExtensions(extensions: string[]): string[] {
 
 function readCache(): VersionCache | undefined {
   try {
-    return JSON.parse(readFileSync(cacheFile(), "utf-8"));
+    // An unreadable or incomplete cache is no cache: a half-written file must not reach the caller.
+    const cache: unknown = JSON.parse(readFileSync(cacheFile(), "utf-8"));
+    if (typeof cache !== "object" || cache === null) return undefined;
+    const { latestVersion, dismissedVersion, checkedAt, actedVersion, settledExtensionSets, promptedVersions } = cache as Record<string, unknown>;
+    if (typeof latestVersion !== "string") return undefined;
+    if (dismissedVersion !== undefined && typeof dismissedVersion !== "string") return undefined;
+    if (checkedAt !== undefined && typeof checkedAt !== "string") return undefined;
+    if (actedVersion !== undefined && typeof actedVersion !== "string") return undefined;
+    const strings = (value: unknown): string[] | undefined => Array.isArray(value) && value.every((item) => typeof item === "string") ? value : undefined;
+    return {
+      latestVersion, dismissedVersion, checkedAt, actedVersion,
+      settledExtensionSets: strings(settledExtensionSets),
+      promptedVersions: strings(promptedVersions),
+    };
   } catch {
     return undefined;
   }
@@ -184,32 +203,28 @@ async function fetchLatestVersion(): Promise<string | undefined> {
   }
 }
 
+function createPackageManager(ctx: ExtensionContext): DefaultPackageManager {
+  const cwd = ctx.cwd;
+  // SettingsManager.create assumes a trusted project by default, so pass
+  // pi's trust decision; otherwise an untrusted project's settings apply.
+  const projectTrusted = ctx.isProjectTrusted();
+  const agentDir = getAgentDir();
+  return new DefaultPackageManager({
+    cwd,
+    agentDir,
+    settingsManager: SettingsManager.create(cwd, agentDir, { projectTrusted }),
+  });
+}
+
 /**
  * Check for outdated extension packages using pi's own package manager —
  * the same code path behind pi's startup "Package Updates Available" banner.
- * These exports are not documented extension API, so degrade gracefully.
+ * Network or npm failures and a stale ctx mean no extension offer.
  */
-async function checkForExtensionUpdates(cwd: string): Promise<string[]> {
+async function checkForExtensionUpdates(ctx: ExtensionContext): Promise<string[]> {
   try {
-    const mod = (await import("@earendil-works/pi-coding-agent")) as Record<string, any>;
-    const { DefaultPackageManager, SettingsManager } = mod;
-    if (
-      typeof DefaultPackageManager !== "function" ||
-      typeof SettingsManager?.create !== "function"
-    ) {
-      return [];
-    }
-    const agentDir = getAgentDir();
-    const packageManager = new DefaultPackageManager({
-      cwd,
-      agentDir,
-      settingsManager: SettingsManager.create(cwd, agentDir),
-    });
-    const updates = await packageManager.checkForAvailableUpdates();
-    if (!Array.isArray(updates)) return [];
-    return updates
-      .map((update) => String(update?.displayName ?? update?.source ?? ""))
-      .filter(Boolean);
+    const updates = await createPackageManager(ctx).checkForAvailableUpdates();
+    return updates.map((update) => update.displayName);
   } catch {
     return [];
   }
@@ -225,12 +240,50 @@ function getCachedUpgradeVersion(): string | undefined {
   return cache.latestVersion;
 }
 
+/**
+ * What is installed for every configured package: its package.json version
+ * and, for a git checkout, its commit. Undefined when that cannot be read.
+ */
+async function readPackageRevisions(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+): Promise<string | undefined> {
+  try {
+    const revisions: string[] = [];
+    for (const { source, scope, installedPath } of createPackageManager(ctx).listConfiguredPackages()) {
+      if (!installedPath) continue;
+      let version: string | undefined;
+      try {
+        const manifest = JSON.parse(readFileSync(join(installedPath, "package.json"), "utf-8"));
+        if (typeof manifest.version === "string") version = manifest.version;
+      } catch {
+        // No readable package.json: the commit below still identifies a git package.
+      }
+      let commit: string | undefined;
+      if (existsSync(join(installedPath, ".git"))) {
+        const git = await pi.exec("git", ["rev-parse", "HEAD"], { cwd: installedPath, timeout: 10_000 });
+        commit = git.stdout.trim();
+        if (git.code !== 0 || git.killed || !commit) throw new Error(`No commit for ${source}`);
+      }
+      // Two unreadable snapshots would compare equal and hide a real update.
+      if (version === undefined && commit === undefined) throw new Error(`No revision for ${source}`);
+      revisions.push([scope, source, version, commit].join(" "));
+    }
+    return revisions.join("\n");
+  } catch {
+    return undefined;
+  }
+}
+
 function saveLatestToCache(latest: string) {
   const prev = readCache();
   writeCache({
     latestVersion: latest,
     dismissedVersion: prev?.dismissedVersion,
+    actedVersion: prev?.actedVersion,
     checkedAt: new Date().toISOString(),
+    settledExtensionSets: prev?.settledExtensionSets,
+    promptedVersions: prev?.promptedVersions,
   });
 }
 
@@ -304,6 +357,27 @@ export function shouldPromptForVersion(input: {
   return true;
 }
 
+/**
+ * Version of the pi package a restart would launch: the package that owns
+ * process.argv[1] now. npm replaces that package in place and pnpm repoints
+ * its symlink, so the version changes. Installs that keep versions side by
+ * side (pi.dev installer, custom update commands) leave it unchanged.
+ */
+function readRestartPiVersion(): string | undefined {
+  try {
+    let dir = dirname(realpathSync(process.argv[1]));
+    while (!existsSync(join(dir, "package.json"))) {
+      const parent = dirname(dir);
+      if (parent === dir) return undefined;
+      dir = parent;
+    }
+    const { version } = JSON.parse(readFileSync(join(dir, "package.json"), "utf-8"));
+    return typeof version === "string" ? version : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function isBunFsPath(path: string): boolean {
   return path.includes("$bunfs") || path.includes("~BUN") || path.includes("%7EBUN");
 }
@@ -321,10 +395,68 @@ function currentPiCommand(args: string[]): { program: string; args: string[] } {
   return { program: process.execPath, args };
 }
 
+// The restart passes the current session itself.
+const SESSION_FLAGS = new Set(["--continue", "-c", "--resume", "-r", "--no-session"]);
+const SESSION_FLAGS_WITH_VALUE = new Set(["--session", "--session-id", "--fork"]);
+
+/**
+ * The arguments pi was started with, minus what must not apply twice: the
+ * first prompt and attached files, and the flags that select a session.
+ * A saved conversation restores its model, thinking level and name.
+ * Return undefined when the arguments cannot be replayed safely.
+ */
+function restartFlags(argv: string[], restoresSessionState: boolean, restoresSessionName: boolean): string[] | undefined {
+  const original = parseArgs(argv);
+  // A key may rely on a scoped model that pi will not select on resume.
+  if (original.apiKey !== undefined) return undefined;
+  const droppedWithValue = new Set(SESSION_FLAGS_WITH_VALUE);
+  if (restoresSessionState) {
+    for (const flag of ["--provider", "--model", "--thinking"]) {
+      droppedWithValue.add(flag);
+    }
+  }
+  if (restoresSessionName) {
+    droppedWithValue.add("--name");
+    droppedWithValue.add("-n");
+  }
+  const kept: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (droppedWithValue.has(arg)) {
+      i++;
+      continue;
+    }
+    if (SESSION_FLAGS.has(arg)) continue;
+    // Pi's own parser decides what is prompt text or a file: argument i is
+    // one exactly when it adds a message or a file to the parse.
+    const before = parseArgs(argv.slice(0, i));
+    const after = parseArgs(argv.slice(0, i + 1));
+    if (after.messages.length > before.messages.length || after.fileArgs.length > before.fileArgs.length) continue;
+    kept.push(arg);
+  }
+  original.messages.length = 0;
+  original.fileArgs.length = 0;
+  const expected: Partial<ReturnType<typeof parseArgs>> = original;
+  for (const field of ["session", "sessionId", "fork", "continue", "resume", "noSession",
+    ...(restoresSessionState ? ["provider", "model", "thinking"] : []),
+    ...(restoresSessionName ? ["name"] : [])]) {
+    delete expected[field as keyof typeof expected];
+  }
+  // Removing a flag-like value can make its option swallow the next flag.
+  // Check the full parse, including empty prompts, diagnostics and extension flags.
+  if (!isDeepStrictEqual(parseArgs(kept), expected)) return undefined;
+  return kept;
+}
+
 interface InstallFailure {
   code: number;
   output: string;
 }
+
+/** What an install run reported: how it ended, and whether the installed set actually changed. */
+interface InstallOutcome { output: string; unchanged: boolean }
+
+type NativeUpdateResult = { ok: true; output: string } | { ok: false; failure: InstallFailure };
 
 function formatInstallFailure(failure: InstallFailure, display: string): string {
   return `Update failed while running \`${display}\` (exit ${failure.code})${failure.output ? `: ${failure.output}` : ""}`;
@@ -368,7 +500,7 @@ async function hostCanRunCustom(ctx: ExtensionContext): Promise<boolean> {
 async function runNativeUpdate(
   pi: ExtensionAPI,
   target: UpdateTarget,
-): Promise<InstallFailure | undefined> {
+): Promise<NativeUpdateResult> {
   const previousSkip = process.env[ENV_SKIP_VERSION_CHECK];
   const previousInternalSkip = process.env[ENV_INTERNAL_SKIP];
   delete process.env[ENV_SKIP_VERSION_CHECK];
@@ -377,14 +509,18 @@ async function runNativeUpdate(
   try {
     const cmd = currentPiCommand([...UPDATE_COMMANDS[target].args]);
     const result = await pi.exec(cmd.program, cmd.args, { timeout: 300_000 });
+    const output = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
     // A timed-out process is killed and can report exit code 0; treat it as failure.
     if (result.killed || result.code !== 0) {
-      const output = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
       return {
-        code: result.code,
-        output: result.killed ? ["Update timed out after 5 minutes.", output].filter(Boolean).join("\n") : output,
+        ok: false,
+        failure: {
+          code: result.code,
+          output: result.killed ? ["Update timed out after 5 minutes.", output].filter(Boolean).join("\n") : output,
+        },
       };
     }
+    return { ok: true, output };
   } finally {
     if (previousSkip === undefined) delete process.env[ENV_SKIP_VERSION_CHECK];
     else process.env[ENV_SKIP_VERSION_CHECK] = previousSkip;
@@ -395,7 +531,13 @@ async function runNativeUpdate(
 }
 
 export default function (pi: ExtensionAPI) {
-  // Take over pi's built-in version notice with our interactive prompt,
+  // Left behind by the removed scoped model hints. This cleanup can go in a
+  // later release.
+  try {
+    rmSync(join(getAgentDir(), "model-update-cache.json"), { force: true });
+  } catch {}
+
+  // Take over pi's built-in version notice with our update notice,
   // unless the user disabled version checks themselves.
   const suppressNativeCheck = !userSkippedVersionCheck;
   if (suppressNativeCheck) {
@@ -403,6 +545,8 @@ export default function (pi: ExtensionAPI) {
     process.env[ENV_INTERNAL_SKIP] = "1";
   }
 
+  // Once /update has run, its result replaces the automatic offer for good.
+  let manualCheckStarted = false;
   let promptOpen = false;
   const promptedVersions = new Set<string>();
   let liveCheckStarted = false;
@@ -425,22 +569,41 @@ export default function (pi: ExtensionAPI) {
     return ctx.hasUI && !!process.stdin.isTTY && !!process.stdout.isTTY;
   }
 
-  async function restartPi(ctx: ExtensionContext): Promise<boolean> {
+  function restartArguments(ctx: ExtensionContext): string[] | undefined {
+    if (!canAutoRestart(ctx)) return undefined;
     const sessionFile = ctx.sessionManager.getSessionFile();
-    const restartArgs = sessionFile ? ["--session", sessionFile] : ["--no-session"];
-    const cmd = currentPiCommand(restartArgs);
+    const restoresSessionState = !!sessionFile && ctx.sessionManager.buildSessionProjection().messages.length > 0;
+    // A persisted name survives even when /tree moves before the first message.
+    const restoresSessionName = !!sessionFile && existsSync(sessionFile);
+    const flags = restartFlags(process.argv.slice(2), restoresSessionState, restoresSessionName);
+    if (!flags) return undefined;
+    // Put session arguments before any trailing "--". Never show arguments:
+    // they can contain credentials supplied to extensions.
+    return [...(sessionFile ? ["--session", sessionFile] : ["--no-session"]), ...flags];
+  }
+
+  async function restartPi(ctx: ExtensionContext, args: string[]): Promise<boolean> {
+    // A removed launch folder must not leave the terminal stopped.
+    let cwd: string;
+    try {
+      cwd = process.cwd();
+    } catch {
+      return false;
+    }
+    const cmd = currentPiCommand(args);
     const env = { ...process.env };
     if (suppressNativeCheck) {
       delete env[ENV_SKIP_VERSION_CHECK];
       delete env[ENV_INTERNAL_SKIP];
     }
-    // The user just acted on an update prompt; don't greet them with another.
+    // The user just acted on an update prompt; skip the startup notice.
     env[ENV_SUPPRESS_STARTUP_CHECK] = "1";
 
     return ctx.ui.custom<boolean>((tui, _theme, _kb, done) => {
       tui.stop();
       const result = spawnSync(cmd.program, cmd.args, {
-        cwd: ctx.cwd,
+        // Original CLI paths are relative to the launch folder, not the resumed session.
+        cwd,
         env,
         stdio: "inherit",
         windowsHide: false,
@@ -464,7 +627,7 @@ export default function (pi: ExtensionAPI) {
     // Restart into the same session instead — at startup this is cheap
     // and the user already consented by choosing "Update now".
     if (canAutoRestart(ctx)) {
-      const ok = await restartPi(ctx);
+      const ok = await restartPi(ctx, restartArguments(ctx) ?? []);
       if (ok) {
         ctx.shutdown();
         return;
@@ -473,14 +636,24 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.notify("Extensions updated. Run /reload to load them.", "info");
   }
 
-  async function doInstall(ctx: ExtensionContext, target: UpdateTarget, piLatest?: string) {
+  async function doInstall(
+    ctx: ExtensionContext,
+    target: UpdateTarget,
+    offer: UpdateOffer,
+  ) {
+    // Installing mid-run would restart or reload under the running agent.
+    if (!ctx.isIdle()) {
+      ctx.ui.notify("Pi is busy. Run /update again when the agent has finished.", "warning");
+      return;
+    }
+
     const command = UPDATE_COMMANDS[target];
-    const success = (await hostCanRenderLoader(ctx))
+    const outcome = (await hostCanRenderLoader(ctx))
       ? await installBehindLoader(ctx, target, command)
       : await installWithNotices(ctx, target, command);
 
-    if (!success) return;
-    return finishInstall(ctx, target, piLatest);
+    if (!outcome) return;
+    return finishInstall(ctx, target, offer, outcome);
   }
 
   // Hosts without a TUI (pi-web and any other RPC host) cannot draw the loader.
@@ -490,21 +663,21 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     target: UpdateTarget,
     command: (typeof UPDATE_COMMANDS)[UpdateTarget],
-  ): Promise<boolean> {
+  ): Promise<InstallOutcome | undefined> {
     ctx.ui.notify(`Running ${command.display}...`, "info");
     try {
-      const failure = await runNativeUpdate(pi, target);
-      if (failure) {
-        ctx.ui.notify(formatInstallFailure(failure, command.display), "error");
-        return false;
+      const update = await runNativeUpdate(pi, target);
+      if (!update.ok) {
+        ctx.ui.notify(formatInstallFailure(update.failure, command.display), "error");
+        return undefined;
       }
-      return true;
+      return { output: update.output, unchanged: false };
     } catch (error) {
       ctx.ui.notify(
         `Update failed: ${error instanceof Error ? error.message : String(error)}`,
         "error",
       );
-      return false;
+      return undefined;
     }
   }
 
@@ -512,18 +685,31 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     target: UpdateTarget,
     command: (typeof UPDATE_COMMANDS)[UpdateTarget],
-  ): Promise<boolean> {
-    const done_ = await ctx.ui.custom<boolean>((tui, theme, _kb, done) => {
-      const loader = new BorderedLoader(tui, theme, `Running ${command.display}...`);
-      loader.onAbort = () => done(false);
+  ): Promise<InstallOutcome | undefined> {
+    // Not cancellable: closing the loader would leave `pi update` running unseen.
+    const result = await ctx.ui.custom<InstallOutcome | null>((tui, theme, _kb, done) => {
+      const loader = new BorderedLoader(tui, theme, `Running ${command.display}...`, {
+        cancellable: false,
+      });
 
-      runNativeUpdate(pi, target)
-        .then((failure) => {
-          if (failure) {
-            ctx.ui.notify(formatInstallFailure(failure, command.display), "error");
-            done(false);
+      // `pi update` exits 0 even when stale npm metadata kept every package at
+      // its old version, so compare what is installed before and after. This
+      // runs under the loader, which keeps the user from starting a run.
+      const install = async () => {
+        const before = target === "extensions" ? await readPackageRevisions(pi, ctx) : undefined;
+        const update = await runNativeUpdate(pi, target);
+        const unchanged =
+          update.ok && before !== undefined && before === (await readPackageRevisions(pi, ctx));
+        return { update, unchanged };
+      };
+
+      install()
+        .then(({ update, unchanged }) => {
+          if (update.ok) {
+            done({ output: update.output, unchanged });
           } else {
-            done(true);
+            ctx.ui.notify(formatInstallFailure(update.failure, command.display), "error");
+            done(null);
           }
         })
         .catch((error) => {
@@ -531,21 +717,37 @@ export default function (pi: ExtensionAPI) {
             `Update failed: ${error instanceof Error ? error.message : String(error)}`,
             "error",
           );
-          done(false);
+          done(null);
         });
 
-      return loader;
+        return loader;
     });
-    return done_ === true;
+    return result ?? undefined;
   }
 
-  async function finishInstall(ctx: ExtensionContext, target: UpdateTarget, piLatest?: string) {
+  async function finishInstall(
+    ctx: ExtensionContext,
+    target: UpdateTarget,
+    offer: UpdateOffer,
+    result: InstallOutcome,
+  ) {
     if (target === "extensions") {
+      // Reloading after an update that installed nothing would only bring the
+      // same prompt back.
+      if (result.unchanged) {
+        ctx.ui.notify(
+          [`Extensions were not updated: ${offer.extensions.join(", ")}`, result.output]
+            .filter(Boolean)
+            .join("\n\n"),
+          "warning",
+        );
+        return;
+      }
       await reloadExtensions(ctx);
       return;
     }
 
-    const latest = piLatest ?? "latest";
+    const latest = offer.piLatest ?? "latest";
     const restartTip = ctx.sessionManager.getSessionFile()
       ? "Tip: run `pi -c` to continue this session."
       : "Tip: run `pi --no-session` to continue without a saved session.";
@@ -569,9 +771,22 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    // Restarting relaunches process.argv[1], so only do it when that now
+    // leads to a different version than the one running.
+    const updatedInPlace = (readRestartPiVersion() ?? VERSION) !== VERSION;
+
+    const args = updatedInPlace ? restartArguments(ctx) : undefined;
+    if (!args) {
+      ctx.ui.notify(
+        `Updated to ${latest}! Please restart pi.\n${restartTip}`,
+        "info",
+      );
+      return;
+    }
+
     // No confirmation: choosing the update option was the consent, and the
     // restart relaunches straight into the current session.
-    const ok = await restartPi(ctx);
+    const ok = await restartPi(ctx, args);
     if (ok) {
       ctx.shutdown();
       return;
@@ -583,11 +798,18 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
+  async function doInstallFromPrompt(
+    ctx: ExtensionContext,
+    target: UpdateTarget,
+    offer: UpdateOffer,
+  ): Promise<void> {
+    await doInstall(ctx, target, offer);
+  }
+
   async function showUpdatePrompt(
     ctx: ExtensionContext,
     offer: UpdateOffer,
-    install: (target: UpdateTarget, piLatest?: string) => Promise<void> =
-      (target, piLatest) => doInstall(ctx, target, piLatest),
+    install: (target: UpdateTarget) => Promise<void> = (target) => doInstallFromPrompt(ctx, target, offer),
     decisions: UpdateDecisions = RECORDED_DECISIONS,
   ) {
     const { piLatest, extensions } = offer;
@@ -622,8 +844,9 @@ export default function (pi: ExtensionAPI) {
       // and an unrecorded action is what made the prompt return.
       decisions.actOnVersion(piLatest);
       if (choice === updateAll || choice === updateExtensions) decisions.settleExtensionSet(extensions);
-      if (choice === updateAll) return install("all", piLatest);
-      if (choice === updatePi) return install("self", piLatest);
+      if (!choice || choice === "Skip") return;
+      if (choice === updateAll) return install("all");
+      if (choice === updatePi) return install("self");
       if (choice === updateExtensions) return install("extensions");
       return;
     }
@@ -646,7 +869,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (choice !== updateAction) return;
-      await install("self", piLatest);
+      await install("self");
       return;
     }
 
@@ -713,18 +936,21 @@ export default function (pi: ExtensionAPI) {
     if (liveCheckStarted) return;
     liveCheckStarted = true;
 
-    // Model hints are independent: a slow catalog must not delay update prompts.
-    void checkForModelUpdates(ctx);
-
-    // Wait for both checks and show a single consolidated prompt. Startup is
-    // never blocked; the prompt simply appears when the checks resolve.
+    // Check once per process and report both results without taking input.
     void Promise.all([
       refreshLatestVersionInCache().catch(() => undefined),
-      checkForExtensionUpdates(ctx.cwd).catch(() => [] as string[]),
+      checkForExtensionUpdates(ctx).catch(() => [] as string[]),
     ])
       .then(([latest, extensions]) => {
-        // Fall back to a previously cached pi version if the live fetch failed.
-        return maybeShowAutoPrompt(ctx, latest ?? getCachedUpgradeVersion(), extensions);
+        if (manualCheckStarted || !ctx.hasUI) return;
+        const cache = readCache();
+        const version = latest ?? cache?.latestVersion;
+        const updates: string[] = [];
+        if (version && isNewer(version, VERSION) && cache?.dismissedVersion !== version) {
+          updates.push(`pi ${VERSION} → ${version}`);
+        }
+        if (extensions.length) updates.push(`extensions: ${extensions.join(", ")}`);
+        if (updates.length) ctx.ui.notify(`Updates available: ${updates.join(" · ")}. Run /update to install.`, "info");
       })
       .catch(() => {});
   }
@@ -742,21 +968,11 @@ export default function (pi: ExtensionAPI) {
     handler: async (rawArgs, ctx) => {
       // The demo uses the real presentation with fixture data and an inert installer.
       if (rawArgs?.trim() === "--test") {
-        if (!ctx.hasUI || ("mode" in ctx && ctx.mode !== "tui")) {
+        if (!ctx.hasUI || ctx.mode !== "tui") {
           ctx.ui.notify("The update demo requires an interactive terminal.", "warning");
           return;
         }
-        const modelNotice = formatModelUpdates(ctx, [
-          {
-            current: { provider: "openai-codex", id: "gpt-6-sol", name: "GPT-6 Sol" },
-            latest: { provider: "openai-codex", id: "gpt-6.1-sol", name: "GPT-6.1 Sol" },
-          },
-          {
-            current: { provider: "anthropic", id: "claude-sonnet-5", name: "Claude Sonnet 5" },
-            latest: { provider: "anthropic", id: "claude-sonnet-5-5", name: "Claude Sonnet 5.5" },
-          },
-        ]);
-        ctx.ui.notify(`Demo only. Nothing will be changed.\n\n${modelNotice}`, "info");
+        ctx.ui.notify("Demo only. Nothing will be changed.", "info");
         await showUpdatePrompt(ctx, {
           piLatest: "99.0.0",
           extensions: ["example-tools", "example-prompts"],
@@ -771,7 +987,7 @@ export default function (pi: ExtensionAPI) {
             return loader;
           });
           const status = completed ? "Demo complete. Nothing changed." : "Demo cancelled. Nothing changed.";
-          ctx.ui.notify(`${status}\n\n${modelNotice}`, "info");
+          ctx.ui.notify(status, "info");
         }, UNRECORDED_DECISIONS);
         return;
       }
@@ -784,17 +1000,8 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      let modelNotice: string | undefined;
-      let updateStatus: string | undefined;
-      // Pi replaces consecutive info notices. Preserve both results, whichever
-      // check finishes first, without making the update prompt wait for models.
-      const showUpdateStatus = () => {
-        ctx.ui.notify([updateStatus, modelNotice].filter(Boolean).join("\n\n"), "info");
-      };
-      void checkForModelUpdates(ctx, true, (message) => {
-        modelNotice = message;
-        showUpdateStatus();
-      });
+      // Avoid a duplicate notice if the automatic check is still running.
+      manualCheckStarted = true;
 
       const result = await ctx.ui.custom<{
         latest: string | undefined;
@@ -808,7 +1015,7 @@ export default function (pi: ExtensionAPI) {
         loader.onAbort = () => done(null);
         Promise.all([
           fetchLatestVersion().catch(() => undefined),
-          checkForExtensionUpdates(ctx.cwd).catch(() => [] as string[]),
+          checkForExtensionUpdates(ctx).catch(() => [] as string[]),
         ])
           .then(([latest, extensions]) => done({ latest, extensions }))
           .catch(() => done(null));
@@ -826,13 +1033,13 @@ export default function (pi: ExtensionAPI) {
       const piLatest = latest && isNewer(latest, VERSION) ? latest : undefined;
 
       if (!piLatest && extensions.length === 0) {
-        updateStatus = `pi ${VERSION} · extensions up to date`;
-        showUpdateStatus();
+        ctx.ui.notify(`pi ${VERSION} · extensions up to date`, "info");
         return;
       }
 
       if (piLatest) { promptedVersions.add(piLatest); notePromptedVersion(piLatest); }
-      await showUpdatePrompt(ctx, { piLatest, extensions });
+      const offer = { piLatest, extensions };
+      await showUpdatePrompt(ctx, offer);
     },
   });
 }

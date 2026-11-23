@@ -1,33 +1,31 @@
 # Changelog
 
-## 0.8.0 - 2026-11-20
+## 0.9.0 - 2026-11-23
 
-- Merges upstream 0.8.0, 0.7.0, 0.6.0 and 0.5.1: Pi 1.0 or newer, restart and update-flow fixes, project-trust aware extension checks, a validated version cache, and installing from hosts that cannot draw the loader (PI WEB and other RPC hosts) through notices.
-- The manifest names the repository's bugs URL and homepage, and the README lists the tracker.
+- Gang of Beads distribution: merges upstream 0.5.1 through 0.8.0 (Pi 1.0 or newer, restart-flag keeping, project-trust aware extension checks, a validated version cache, automatic checks reported as a notification, model hints removed) onto this fork's own work: every answered prompt settles, decisions are machine-level, a version the user acted on does not re-prompt, a stale context is survived, and hosts that cannot draw the loader (PI WEB and other RPC hosts) install through notices.
 
-## 0.6.0 - 2026-10-16
+## 0.8.0 - 2026-11-19
 
-- Publish the stable Gang of Beads distribution as `@gang-of-beads/pi-updater`. Existing update commands and provider settings remain unchanged.
+- Automatic checks now list available updates in a notification without taking keyboard input. Run `/update` to choose what to install. ([#18](https://github.com/tonze/pi-updater/issues/18))
 
-- Merges upstream 0.5.0 (model-family update hints, the offline `/update --test`
-  demo) and 0.4.2 (the stale-context crash fix, alongside this fork's own).
-- A host that does not run custom components (PI WEB) shows the update offer
-  itself, so sessions there no longer prompt on their own.
+## 0.7.0 - 2026-11-16
 
-## 0.6.0-preview.0
+- Remove scoped model hints. They guessed the successor of a model from catalog data. In a test, 139 of 600 hints named the wrong model. pi-updater no longer downloads the models.dev catalog. See [#14](https://github.com/tonze/pi-updater/issues/14).
+- The restart after an update keeps the flags you started Pi with. Before, it dropped them. If Pi was started with `--api-key`, pi-updater now asks you to restart Pi yourself. ([#15](https://github.com/tonze/pi-updater/issues/15))
+- A damaged version cache no longer stops the update prompt that is shown when pi.dev cannot be reached. ([#16](https://github.com/tonze/pi-updater/issues/16))
 
-Preview build for hands-on testing before a stable release.
+## 0.6.0 - 2026-11-14
 
-- Every answered prompt settles, including Skip on the pi-only prompt, so a
-  decision is never re-asked in the same session.
-- Extension update decisions are machine-level: answering on one machine does
-  not silence the prompt on another.
-- A version the user acted on no longer re-prompts.
-- A stale `ctx` is survived rather than taking the host daemon down with it.
-- Hosts with no terminal install the update themselves; hosts that cannot run
-  it are not offered the action.
-- Verified against `@earendil-works/pi-coding-agent` 0.85.0 (the version PI WEB
-  builds against): typecheck clean and all tests pass.
+- Requires Pi 1.0.0 or later. On older versions, pin `pi-updater@0.5.1`.
+- Fix the restart after a Pi update starting the old version again. This affected installs from the pi.dev installer and custom update commands. There, pi-updater now asks you to restart Pi yourself.
+- If an extension update leaves the packages unchanged, show Pi's output and skip the reload. Before, the same prompt came back on the next launch.
+- An update can no longer be dismissed with Escape while it installs. Before, it kept running in the background.
+- The update prompt now waits until the agent has finished.
+
+## 0.5.1 - 2026-11-14
+
+- Fix extension update checks ignoring Pi's project trust. In a project you had not trusted, the check still read `.pi/settings.json`, including its `npmCommand`. The check now uses Pi's trust decision for the current project.
+- Extension update checks now need Pi 0.79.1 or later. On older versions only Pi updates are offered.
 
 ## 0.5.0 - 2026-09-30
 
